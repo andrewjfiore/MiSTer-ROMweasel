@@ -2,10 +2,11 @@
 
 # Script sets its own options and restores caller options on exit
 setopt localoptions extendedglob pipefail warnnestedvar nullglob
+autoload zmv
 
 # Initialise all readonly global variables
 init_static_globals () {
-    typeset -gr ROMWEASEL_VERSION="MiSTer ROMweasel v0.9.13"
+    typeset -gr ROMWEASEL_VERSION="MiSTer ROMweasel v0.9.14"
 
     # Required software to run
     typeset -gr XMLLINT=$(which xmllint)    || { print "ERROR: 'xmllint' not found" ; return 1 }
@@ -392,6 +393,51 @@ get_rom_gamedir () {
     print $odir ; return 1
 }
 
+ao486_append_setname () {
+    local mgl="$*"
+    local game=${mgl:t:r}
+
+    # Use the VHD filename as setname
+    local setname=$(xmllint <(sed -e 's/\&\([^\amp;]\)/\&amp;\1/g' $mgl) \
+                    --xpath "string(/mistergamedescription/file/@path)")
+    setname="AO486 ${setname:t:r}"
+
+    # Ensure <setname> element doesn't already exist
+    xmllint <(sed -e 's/\&\([^\amp;]\)/\&amp;\1/g' $mgl) \
+        --xpath "/mistergamedescription/setname" &>/dev/null
+    if (( $? == 0 )); then
+        #print "Element <setname> already set for game: $game"
+        return
+    fi
+
+    local tmpf=$(mktemp)
+    awk '/<\/mistergamedescription>/{print "    <setname same_dir=\"1\">'$setname'<\/setname>"}1' \
+        $mgl > $tmpf
+    cat $tmpf > $mgl
+    rm $tmpf
+
+    # Copy base AO486 configurations for the new setname (except keybindings)
+    pushd /media/fat/config
+    cp -n AO486.CFG ${setname}.CFG
+    noglob zmv -W -C AO486_*.cfg ${setname}_*.cfg 2>/dev/null
+    popd
+
+    print "Created unique <setname> for game: $game"
+}
+
+# Append <setname> elements to all 0MHz DOS collection games
+ao486_setnames_all () {
+    local -a mgls=("/media/fat/_DOS Games"/*.mgl)
+
+    print "${#mgls} games found, processing.."
+
+    local mgl
+    for mgl in $mgls; do
+        ao486_append_setname $mgl
+    done
+    print "Done!"
+}
+
 # Download selected ROMs
 download_roms () {
     local -a tags=(${*})
@@ -450,6 +496,15 @@ download_roms () {
             rm "$ofile"
         elif [[ -z ${tag##*.zip} ]]; then
             $UNZIP -o -qq -d "$dest" "$ofile"
+
+            # Append unique setname tag for 0MHz DOS collection games, so they
+            # get individual config files and can retain game-specific
+            # keymappings, etc. Current AO486_*.cfg files are copied for the new
+            # basename, so settings like video filters are retained.
+            if [[ ${CORE[1,5]} = "AO486" ]]; then
+                local mgl=$CORE_GAMEDIR/$($UNZIP -l "$ofile" | grep -o '_DOS Games/.*\.mgl$')
+                ao486_append_setname "$mgl"
+            fi
             rm "$ofile"
         else
             mv "$ofile" "$dest"
@@ -692,6 +747,10 @@ main () {
     # Fetch user-configurable configuration settings from ${SETTINGS_SH} or create it if it
     # doesn't yet exist, then set defaults for all which weren't explicitly set by the user.
     get_config
+
+    # Secret feature, if optional cmdline argument is the path to 0MHz DOS collection MGL
+    # directory, append <setname> tags and copy configs for all of them
+    [[ $* == "/media/fat/_DOS Games" ]] && { ao486_setnames_all ; return }
 
     # Login to archive.org if IA_USER/IA_PASS are set and use a cookie for remainder of
     # download operations.
