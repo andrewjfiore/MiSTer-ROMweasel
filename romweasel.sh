@@ -400,7 +400,11 @@ ao486_append_setname () {
     # Use the VHD filename as setname
     local setname=$(xmllint <(sed -e 's/\&\([^\amp;]\)/\&amp;\1/g' $mgl) \
                     --xpath "string(/mistergamedescription/file/@path)")
-    setname="AO486 ${setname:t:r}"
+
+    # Setname value has 32 character limit. This will invariably lead to some
+    # name collisions, but it's still preferable to the added complexity from
+    # any solution which guarantees unique names (checksums, etc.)
+    setname="AO486 ${${${setname:t}%%\.*}[1,26]}"
 
     # Ensure <setname> element doesn't already exist
     xmllint <(sed -e 's/\&\([^\amp;]\)/\&amp;\1/g' $mgl) \

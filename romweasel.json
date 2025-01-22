@@ -6,8 +6,8 @@
     "default_options": {},
     "files": {
         "Scripts/romweasel.sh": {
-            "hash": "ec5803d8231db66200ed79caee2e0681",
-            "size": 34795,
+            "hash": "9f42c43873b184cbde1750b4a4b8a799",
+            "size": 35034,
             "url": "https://raw.githubusercontent.com/Koston-0xDEADBEEF/MiSTer-ROMweasel/main/romweasel.sh"
         }
     },
@@ -16,6 +16,6 @@
         "Scripts/.config": {},
         "Scripts/.config/romweasel": {}
     },
-    "timestamp": 1737486843,
+    "timestamp": 1737570968,
     "zips": {}
 }
