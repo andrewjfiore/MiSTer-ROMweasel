@@ -1,8 +1,6 @@
 # MiSTer-ROMweasel
 
-ROM downloader tool for MiSTer FPGA (release version 0.9.14)
-
-Thread in official MiSTer Forum: https://misterfpga.org/viewtopic.php?p=63089
+ROM downloader tool for MiSTer FPGA (release version 0.9.15)
 
 ## Usage
 
@@ -44,7 +42,7 @@ and then re-download ROM repository metadata.
 - Separate simple mode for operating with joysticks with only few buttons
 - Verify each ROM checksum after downloading
 - If an interrupted download is retried, attempts to continue where it left off
-- Appends a unique `<setname>` element to all 0MHz DOS collection games
+- Appends a custom `<setname>` element to all 0MHz DOS collection games
 
 ## Tips
 
@@ -55,7 +53,7 @@ If executed from cmdline with a directory path as argument, `.chd` files in that
 directory are sorted into their own subdirectories. If it fails to automatically
 determine correct subdirectory name, that file is simply not moved.
 
-If executed from cmdline with `/media/fat/_DOS Games` as argument, an unique
+If executed from cmdline with `/media/fat/_DOS Games` as argument, a custom
 `<setname>` element is appended to all MGL files in that directory. This allows
 storing individual configurations per DOS game (button to key maps especially).
 
