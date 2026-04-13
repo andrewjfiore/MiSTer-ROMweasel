@@ -56,6 +56,17 @@ init_static_globals () {
         "WS"        "WonderSwan" \
         "WSC"       "WonderSwan Color" \
         "PV1000"    "Casio PV-1000" \
+        "NEOGEO"    "SNK Neo Geo (AES/MVS)" \
+        "NEOGEOCD"  "SNK Neo Geo CD" \
+        "TDO"       "Panasonic 3DO" \
+        "S32X"      "SEGA 32X" \
+        "CDI"       "Philips CD-i" \
+        "JAG"       "Atari Jaguar" \
+        "A2600"     "Atari 2600" \
+        "A5200"     "Atari 5200" \
+        "A7800"     "Atari 7800" \
+        "MSX"       "MSX / MSX1" \
+        "C64"       "Commodore 64" \
     )
 
     # The prefix "NAME_" must match the core name in above list
@@ -131,6 +142,39 @@ init_static_globals () {
     typeset -gr PV1000_URL="https://archive.org/download/nointro-casio-loopy-pv-1000"
     typeset -gr PV1000_FILES_XML="nointro-casio-loopy-pv-1000_files.xml"
     typeset -gr PV1000_META_XML="nointro-casio-loopy-pv-1000_meta.xml"
+    typeset -gr NEOGEO_URL="https://archive.org/download/neogeoaesmvscomplete"
+    typeset -gr NEOGEO_FILES_XML="neogeoaesmvscomplete_files.xml"
+    typeset -gr NEOGEO_META_XML="neogeoaesmvscomplete_meta.xml"
+    typeset -gr NEOGEOCD_URL="https://archive.org/download/snk-neo-geo-cd-redump-collection"
+    typeset -gr NEOGEOCD_FILES_XML="snk-neo-geo-cd-redump-collection_files.xml"
+    typeset -gr NEOGEOCD_META_XML="snk-neo-geo-cd-redump-collection_meta.xml"
+    typeset -gr TDO_URL="https://archive.org/download/3do-redump-collection"
+    typeset -gr TDO_FILES_XML="3do-redump-collection_files.xml"
+    typeset -gr TDO_META_XML="3do-redump-collection_meta.xml"
+    typeset -gr S32X_URL="https://archive.org/download/ni-se-32x"
+    typeset -gr S32X_FILES_XML="ni-se-32x_files.xml"
+    typeset -gr S32X_META_XML="ni-se-32x_meta.xml"
+    typeset -gr CDI_URL="https://archive.org/download/philips-cd-i-redump-collection"
+    typeset -gr CDI_FILES_XML="philips-cd-i-redump-collection_files.xml"
+    typeset -gr CDI_META_XML="philips-cd-i-redump-collection_meta.xml"
+    typeset -gr JAG_URL="https://archive.org/download/ef_atari_jaguar_no-intro_2023-10-13"
+    typeset -gr JAG_FILES_XML="ef_atari_jaguar_no-intro_2023-10-13_files.xml"
+    typeset -gr JAG_META_XML="ef_atari_jaguar_no-intro_2023-10-13_meta.xml"
+    typeset -gr A2600_URL="https://archive.org/download/nointro.atari-2600"
+    typeset -gr A2600_FILES_XML="nointro.atari-2600_files.xml"
+    typeset -gr A2600_META_XML="nointro.atari-2600_meta.xml"
+    typeset -gr A5200_URL="https://archive.org/download/nointro.atari-5200"
+    typeset -gr A5200_FILES_XML="nointro.atari-5200_files.xml"
+    typeset -gr A5200_META_XML="nointro.atari-5200_meta.xml"
+    typeset -gr A7800_URL="https://archive.org/download/atari-7800-no-intro-romset-2025-06-25"
+    typeset -gr A7800_FILES_XML="atari-7800-no-intro-romset-2025-06-25_files.xml"
+    typeset -gr A7800_META_XML="atari-7800-no-intro-romset-2025-06-25_meta.xml"
+    typeset -gr MSX_URL="https://archive.org/download/ef_msx1_no-intro_2023-12-23"
+    typeset -gr MSX_FILES_XML="ef_msx1_no-intro_2023-12-23_files.xml"
+    typeset -gr MSX_META_XML="ef_msx1_no-intro_2023-12-23_meta.xml"
+    typeset -gr C64_URL="https://archive.org/download/nointro.c64"
+    typeset -gr C64_FILES_XML="nointro.c64_files.xml"
+    typeset -gr C64_META_XML="nointro.c64_meta.xml"
 
     # Dialog box maximum size, leave a small border in case of overscan
     typeset -gr MAXHEIGHT=$(( $LINES - 4 ))
@@ -188,6 +232,17 @@ set_conf_opts () {
     typeset -gr WS_GAMEDIR=${WS_GAMEDIR:-/media/fat/games/WonderSwan}
     typeset -gr WSC_GAMEDIR=${WSC_GAMEDIR:-/media/fat/games/WonderSwanColor}
     typeset -gr PV1000_GAMEDIR=${PV1000_GAMEDIR:-/media/fat/games/Casio_PV-1000}
+    typeset -gr NEOGEO_GAMEDIR=${NEOGEO_GAMEDIR:-/media/fat/games/NeoGeo}
+    typeset -gr NEOGEOCD_GAMEDIR=${NEOGEOCD_GAMEDIR:-/media/fat/games/NeoGeo-CD}
+    typeset -gr TDO_GAMEDIR=${TDO_GAMEDIR:-/media/fat/games/3DO}
+    typeset -gr S32X_GAMEDIR=${S32X_GAMEDIR:-/media/fat/games/S32X}
+    typeset -gr CDI_GAMEDIR=${CDI_GAMEDIR:-/media/fat/games/CD-i}
+    typeset -gr JAG_GAMEDIR=${JAG_GAMEDIR:-/media/fat/games/Jaguar}
+    typeset -gr A2600_GAMEDIR=${A2600_GAMEDIR:-/media/fat/games/ATARI2600}
+    typeset -gr A5200_GAMEDIR=${A5200_GAMEDIR:-/media/fat/games/ATARI5200}
+    typeset -gr A7800_GAMEDIR=${A7800_GAMEDIR:-/media/fat/games/ATARI7800}
+    typeset -gr MSX_GAMEDIR=${MSX_GAMEDIR:-/media/fat/games/MSX}
+    typeset -gr C64_GAMEDIR=${C64_GAMEDIR:-/media/fat/games/C64}
     # Simplified mode for use without a keyboard (true/false toggle)
     typeset -g JOY_MODE=${JOY_MODE:-false}
 }
