@@ -346,6 +346,12 @@ queue_ensure_dir () {
 # Enqueue an array of ROM tags for the currently selected core.
 # Creates one item dir per tag under $WRK_DIR/queue/<ts>_<slug>/
 # and spawns the dispatcher if not already running.
+#
+# Metadata is serialized as JSON via jq(1) rather than shell-sourceable
+# key=value pairs, because tag/filename values come from remote archive
+# metadata and a malicious or accidentally malformed name containing
+# `$(...)`, backticks, or embedded quotes would otherwise execute as
+# shell code when the worker sources the meta file.
 queue_enqueue () {
     local -a tags=($@)
     local qd=$(queue_ensure_dir)
@@ -355,29 +361,35 @@ queue_enqueue () {
         size=$(get_tag_filesize "$tag")
         sha1=$(get_tag_sha1sum "$tag")
         filename=$(get_tag_filename "$tag")
-        # Unique ordered id: epoch seconds + counter + sanitized name
         ts=$(date +%s)
         slug=${${tag##*/}%.(7z|zip|chd)}
         slug=${slug//[^A-Za-z0-9._-]/_}
         slug=${slug:0:48}
         itemdir="${qd}/${ts}_${i}_${slug}"
         mkdir -p $itemdir
-        # Shell-sourceable meta, avoids embedded newlines in tag
-        {
-            print "TAG=\"${tag}\""
-            print "FILENAME=\"${filename}\""
-            print "CORE=\"${CORE}\""
-            print "CORE_URL=\"${CORE_URL}\""
-            print "CORE_FILES_XML=\"${CORE_FILES_XML}\""
-            print "DEST_DIR=\"${CORE_GAMEDIR}\""
-            print "SIZE=\"${size}\""
-            print "SHA1=\"${sha1}\""
-            print "ADDED_AT=\"${ts}\""
-        } > $itemdir/meta
+        $JQ -n \
+            --arg tag      "$tag" \
+            --arg filename "$filename" \
+            --arg core     "$CORE" \
+            --arg core_url "$CORE_URL" \
+            --arg dest_dir "$CORE_GAMEDIR" \
+            --arg size     "$size" \
+            --arg sha1     "$sha1" \
+            --arg added_at "$ts" \
+            '{tag:$tag, filename:$filename, core:$core, core_url:$core_url, dest_dir:$dest_dir, size:$size, sha1:$sha1, added_at:$added_at}' \
+            > $itemdir/meta.json
         print queued > $itemdir/status
         print 0 > $itemdir/progress
     done
     queue_spawn_dispatcher
+}
+
+# Read a single field from a queue item's meta.json into stdout.
+# Safe against arbitrary characters in the value.
+queue_meta_get () {
+    local itemdir=$1 field=$2
+    [[ -f ${itemdir}/meta.json ]] || return 1
+    $JQ -r ".${field} // \"\"" ${itemdir}/meta.json
 }
 
 # Spawn the dispatcher as a detached background process if not
@@ -427,26 +439,38 @@ queue_total () {
 queue_kill_background () {
     local qd=$(queue_dir)
     [[ -d $qd ]] || return 0
-    # Kill dispatcher
     if [[ -f ${qd}/.dispatcher.pid ]]; then
         local dpid=$(<${qd}/.dispatcher.pid)
         kill -TERM $dpid 2>/dev/null
     fi
-    # Kill workers and re-queue
-    local item wpid st
+    local item wpid wgpid st
     for item in ${qd}/*(N/); do
-        [[ -f ${item}/worker.pid ]] || continue
-        wpid=$(<${item}/worker.pid)
-        kill -TERM $wpid 2>/dev/null
-        rm -f ${item}/worker.pid
+        # Signal the actual downloader first — SIGCONT wakes any
+        # paused child, SIGTERM then lets it exit cleanly. Without
+        # the CONT a STOPped wget never sees TERM and hangs.
+        if [[ -f ${item}/wget.pid ]]; then
+            wgpid=$(<${item}/wget.pid)
+            kill -CONT $wgpid 2>/dev/null
+            kill -TERM $wgpid 2>/dev/null
+        fi
+        if [[ -f ${item}/worker.pid ]]; then
+            wpid=$(<${item}/worker.pid)
+            kill -CONT $wpid 2>/dev/null
+            kill -TERM $wpid 2>/dev/null
+        fi
         [[ -f ${item}/status ]] || continue
         st=$(<${item}/status)
         if [[ $st == "running" || $st == "paused" ]]; then
             print queued > ${item}/status
         fi
     done
-    # Small grace period then SIGKILL any stragglers
     sleep 0.3
+    # Kill any stragglers
+    for item in ${qd}/*(N/); do
+        [[ -f ${item}/wget.pid ]] && kill -KILL $(<${item}/wget.pid) 2>/dev/null
+        [[ -f ${item}/worker.pid ]] && kill -KILL $(<${item}/worker.pid) 2>/dev/null
+        rm -f ${item}/wget.pid ${item}/worker.pid
+    done
     if [[ -f ${qd}/.dispatcher.pid ]]; then
         kill -KILL $(<${qd}/.dispatcher.pid) 2>/dev/null
         rm -f ${qd}/.dispatcher.pid
@@ -476,18 +500,21 @@ queue_dispatcher_loop () {
         (( max < 1 )) && max=1
         (( max > 5 )) && max=5
 
-        # Count running workers; reconcile dead workers
+        # Count workers that are occupying a concurrency slot.
+        # Paused items still count — the wget child is STOP'd but the
+        # download dir/part file is held and un-pausing must not put
+        # the queue over the configured max.
         running=0
         for item in ${qd}/*(N/); do
             [[ -f ${item}/status ]] || continue
             st=$(<${item}/status)
-            if [[ $st == "running" ]]; then
+            if [[ $st == "running" || $st == "paused" ]]; then
                 if [[ -f ${item}/worker.pid ]] && kill -0 $(<${item}/worker.pid) 2>/dev/null; then
                     (( running++ ))
                 else
                     # Worker died without updating status — mark failed
                     print failed > ${item}/status
-                    rm -f ${item}/worker.pid
+                    rm -f ${item}/worker.pid ${item}/wget.pid
                 fi
             fi
         done
@@ -534,9 +561,18 @@ queue_dispatcher_loop () {
 queue_worker_run () {
     local itemdir=$1
     [[ -d $itemdir ]] || exit 1
-    [[ -f ${itemdir}/meta ]] || exit 1
+    [[ -f ${itemdir}/meta.json ]] || exit 1
 
-    source ${itemdir}/meta
+    # Read meta via jq — never sourced, never eval'd. Values can contain
+    # arbitrary characters including backticks, $(...), quotes, etc.
+    local TAG=$(queue_meta_get $itemdir tag)
+    local FILENAME=$(queue_meta_get $itemdir filename)
+    local CORE=$(queue_meta_get $itemdir core)
+    local CORE_URL=$(queue_meta_get $itemdir core_url)
+    local DEST_DIR=$(queue_meta_get $itemdir dest_dir)
+    local SIZE=$(queue_meta_get $itemdir size)
+    local SHA1=$(queue_meta_get $itemdir sha1)
+
     print $$ > ${itemdir}/worker.pid
 
     local tmpfile="${itemdir}/download.part"
@@ -546,16 +582,27 @@ queue_worker_run () {
                      --connect-timeout=15 -O "$tmpfile" "$url")
     [[ -f $cookiejar ]] && wget_args=(--load-cookies "$cookiejar" $wget_args)
 
+    # Trap kills the actual wget child, not just this shell wrapper,
+    # so cancel/exit actually stop the transfer instead of leaving an
+    # orphan wget using bandwidth while the UI thinks it's paused.
     trap '
+        if [[ -f ${itemdir}/wget.pid ]]; then
+            local _wp=$(<${itemdir}/wget.pid)
+            kill -CONT $_wp 2>/dev/null
+            kill -TERM $_wp 2>/dev/null
+        fi
         [[ -f ${itemdir}/status ]] && [[ $(<${itemdir}/status) == "running" ]] \
             && print queued > ${itemdir}/status
-        rm -f ${itemdir}/worker.pid
+        rm -f ${itemdir}/worker.pid ${itemdir}/wget.pid
         exit 130
     ' TERM INT
 
-    # Launch wget, poll progress in this shell
+    # Launch wget, record its actual PID, poll progress in this shell.
+    # queue_item_menu signals ${itemdir}/wget.pid directly for pause
+    # (SIGSTOP) and resume (SIGCONT).
     wget $wget_args 2>>${itemdir}/worker.log &
     local wget_pid=$!
+    print $wget_pid > ${itemdir}/wget.pid
     while kill -0 $wget_pid 2>/dev/null; do
         if [[ -f $tmpfile ]]; then
             stat -c %s "$tmpfile" > ${itemdir}/progress 2>/dev/null
@@ -564,8 +611,10 @@ queue_worker_run () {
     done
     wait $wget_pid
     local rc=$?
+    rm -f ${itemdir}/wget.pid
 
     if [[ $rc -ne 0 ]]; then
+        print "ERROR: wget exited $rc" >> ${itemdir}/worker.log
         print failed > ${itemdir}/status
         rm -f ${itemdir}/worker.pid
         exit $rc
@@ -580,18 +629,40 @@ queue_worker_run () {
         exit 1
     fi
 
-    # Install to dest dir
-    [[ -d "$DEST_DIR" ]] || mkdir -p "$DEST_DIR"
+    # Install to dest dir — each step's exit status is checked and any
+    # failure marks the item 'failed' WITHOUT deleting $tmpfile, so the
+    # partial/verified download can be recovered on retry.
+    if [[ ! -d "$DEST_DIR" ]]; then
+        if ! mkdir -p "$DEST_DIR" 2>>${itemdir}/worker.log; then
+            print "ERROR: mkdir failed for $DEST_DIR" >> ${itemdir}/worker.log
+            print failed > ${itemdir}/status
+            rm -f ${itemdir}/worker.pid
+            exit 1
+        fi
+    fi
     local basefile=${FILENAME##*/}
+    local install_rc=0
     if [[ -z ${basefile##*.7z} ]]; then
         $SZR e "$tmpfile" -o"$DEST_DIR" -y >>${itemdir}/worker.log 2>&1
-        rm -f "$tmpfile"
+        install_rc=$?
     elif [[ -z ${basefile##*.zip} ]]; then
         $UNZIP -o -qq -d "$DEST_DIR" "$tmpfile" >>${itemdir}/worker.log 2>&1
-        rm -f "$tmpfile"
+        install_rc=$?
     else
-        mv "$tmpfile" "${DEST_DIR}/${basefile}"
+        mv "$tmpfile" "${DEST_DIR}/${basefile}" 2>>${itemdir}/worker.log
+        install_rc=$?
     fi
+
+    if (( install_rc != 0 )); then
+        print "ERROR: install step exited $install_rc — tmpfile preserved at $tmpfile" \
+            >> ${itemdir}/worker.log
+        print failed > ${itemdir}/status
+        rm -f ${itemdir}/worker.pid
+        exit $install_rc
+    fi
+
+    # Only now is it safe to remove the verified temp archive.
+    [[ -z ${basefile##*.(7z|zip)} ]] && rm -f "$tmpfile"
 
     print done > ${itemdir}/status
     rm -f ${itemdir}/worker.pid
@@ -604,20 +675,22 @@ queue_view () {
         local -a menu_args items
         menu_args=()
         items=()
-        local item st prog pct name core_name size_mb label icon
+        local item st prog pct name core size size_mb filename label icon
 
         for item in ${qd}/*(N/); do
-            [[ -f ${item}/meta ]] || continue
+            [[ -f ${item}/meta.json ]] || continue
             [[ -f ${item}/status ]] || continue
             st=$(<${item}/status)
             prog=0
             [[ -f ${item}/progress ]] && prog=$(<${item}/progress)
-            source ${item}/meta
+            core=$(queue_meta_get $item core)
+            filename=$(queue_meta_get $item filename)
+            size=$(queue_meta_get $item size)
             pct=0
-            (( SIZE > 0 )) && pct=$(( prog * 100 / SIZE ))
+            (( size > 0 )) && pct=$(( prog * 100 / size ))
             (( pct > 100 )) && pct=100
-            size_mb=$(( SIZE / 1048576 ))
-            name=${FILENAME##*/}
+            size_mb=$(( size / 1048576 ))
+            name=${filename##*/}
             name=${name%.(7z|zip|chd)}
             case $st in
                 queued)    icon="WAIT " ;;
@@ -628,7 +701,7 @@ queue_view () {
                 cancelled) icon="CANCL" ;;
                 *)         icon="?????" ;;
             esac
-            label="[${icon}] ${CORE} ${name} (${size_mb}M)"
+            label="[${icon}] ${core} ${name} (${size_mb}M)"
             items+=("${item}")
             menu_args+=("${item}" "${label:0:$(( MAXWIDTH - 10 ))}")
         done
@@ -667,10 +740,13 @@ queue_view () {
 # Actions for a single queue item
 queue_item_menu () {
     local itemdir=$1
-    [[ -d $itemdir && -f ${itemdir}/meta ]] || return
-    source ${itemdir}/meta
+    [[ -d $itemdir && -f ${itemdir}/meta.json ]] || return
+    local filename=$(queue_meta_get $itemdir filename)
+    local core=$(queue_meta_get $itemdir core)
+    local dest_dir=$(queue_meta_get $itemdir dest_dir)
+    local size=$(queue_meta_get $itemdir size)
     local st=$(<${itemdir}/status)
-    local name=${FILENAME##*/}
+    local name=${filename##*/}
 
     local -a actions=()
     case $st in
@@ -698,27 +774,37 @@ queue_item_menu () {
     actions+=(back "Back")
 
     $DIALOG --clear --title "${name}" \
-        --menu "Status: ${st}\nCore: ${CORE}\nSize: $(( SIZE / 1048576 )) MB" \
+        --menu "Status: ${st}\nCore: ${core}\nSize: $(( size / 1048576 )) MB" \
         16 72 8 $actions 2>$DIALOG_TEMPFILE
     [[ $? -ne $DIALOG_OK ]] && return
     local action=$(<$DIALOG_TEMPFILE)
 
+    # Helper that signals both the wget child (if alive) and the
+    # wrapper worker with the same signal. Pause/resume/cancel must
+    # operate on wget directly, otherwise pausing the wrapper leaves
+    # the download running and the dispatcher miscounts slots.
+    _queue_signal () {
+        local sig=$1
+        [[ -f ${itemdir}/wget.pid ]] && kill -${sig} $(<${itemdir}/wget.pid) 2>/dev/null
+        [[ -f ${itemdir}/worker.pid ]] && kill -${sig} $(<${itemdir}/worker.pid) 2>/dev/null
+    }
+
     case $action in
         pause)
-            [[ -f ${itemdir}/worker.pid ]] && kill -STOP $(<${itemdir}/worker.pid) 2>/dev/null
+            _queue_signal STOP
             print paused > ${itemdir}/status
             ;;
         resume)
-            [[ -f ${itemdir}/worker.pid ]] && kill -CONT $(<${itemdir}/worker.pid) 2>/dev/null
+            _queue_signal CONT
             print running > ${itemdir}/status
             ;;
         cancel)
-            if [[ -f ${itemdir}/worker.pid ]]; then
-                kill -CONT $(<${itemdir}/worker.pid) 2>/dev/null
-                kill -TERM $(<${itemdir}/worker.pid) 2>/dev/null
-            fi
+            # Must CONT before TERM, otherwise a paused process can't
+            # receive the TERM and will never exit.
+            _queue_signal CONT
+            _queue_signal TERM
             print cancelled > ${itemdir}/status
-            rm -f ${itemdir}/download.part ${itemdir}/worker.pid
+            rm -f ${itemdir}/download.part ${itemdir}/worker.pid ${itemdir}/wget.pid
             queue_spawn_dispatcher
             ;;
         retry)
@@ -728,17 +814,14 @@ queue_item_menu () {
             queue_spawn_dispatcher
             ;;
         remove)
-            if [[ -f ${itemdir}/worker.pid ]]; then
-                kill -CONT $(<${itemdir}/worker.pid) 2>/dev/null
-                kill -TERM $(<${itemdir}/worker.pid) 2>/dev/null
-            fi
+            _queue_signal CONT
+            _queue_signal TERM
             rm -rf $itemdir
             ;;
         launch)
-            local target="${DEST_DIR}/${FILENAME##*/}"
-            # For compressed files the base name differs — do a best-effort glob
+            local target="${dest_dir}/${filename##*/}"
             if [[ ! -f $target ]]; then
-                local hits=(${DEST_DIR}/${${FILENAME##*/}%.(7z|zip|chd)}*(N))
+                local hits=(${dest_dir}/${${filename##*/}%.(7z|zip|chd)}*(N))
                 [[ -n $hits ]] && target=$hits[1]
             fi
             if [[ -f $target ]]; then
