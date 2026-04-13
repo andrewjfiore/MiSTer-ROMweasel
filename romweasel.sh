@@ -260,42 +260,41 @@ cleanup () {
 }
 
 # Login to archive.org and setup a cookie for all downloads, if IA_USER/IA_PASS
-# variables are set.
+# variables are set. Uses the xauthn API (services/xauthn/) which returns a JSON
+# payload with session cookies and S3 keys. The older form-post to /account/login
+# stopped returning JSON and started returning the HTML login page, so the old
+# flow's `jq '.status == "ok"'` check always failed.
 ia_login () {
     # Variables are sourced from ~/.profile by other scripts as well
     if [[ -f ~/.profile ]]; then source ~/.profile; fi
     if [[ -z $IA_USER ]] || [[ -z $IA_PASS ]]; then return; fi
 
+    local resp
+    resp=$($CURL $CURL_OPTS -sk -X POST 'https://archive.org/services/xauthn/?op=login' \
+        --data-urlencode "email=$IA_USER" \
+        --data-urlencode "password=$IA_PASS" \
+        --data-urlencode 'version=1' 2>/dev/null)
+
+    if ! print -- "$resp" | $JQ -er '.success' >/dev/null 2>&1; then
+        $DIALOG --title $TITLE \
+            --msgbox "Error logging in to archive.org. Please check IA_USER / IA_PASS variables." 5 78
+        cleanup
+    fi
+
+    local sig user
+    sig=$(print -- "$resp"  | $JQ -r '.values.cookies["logged-in-sig"]'  | cut -d';' -f1)
+    user=$(print -- "$resp" | $JQ -r '.values.cookies["logged-in-user"]' | cut -d';' -f1)
+
+    # Write a Netscape-format cookie jar that curl can read with -b/-c.
+    {
+        print "# Netscape HTTP Cookie File"
+        print ".archive.org\tTRUE\t/\tTRUE\t2147483647\tlogged-in-sig\t${sig}"
+        print ".archive.org\tTRUE\t/\tFALSE\t2147483647\tlogged-in-user\t${user}"
+    } > cookie.tmp
+
     unsetopt warnnestedvar
     CURL_OPTS+=(-c cookie.tmp -b cookie.tmp)
     setopt warnnestedvar
-
-    local u=$(urlencode "$IA_USER")
-    local p=$(urlencode "$IA_PASS")
-
-    # Capture login results to a temporary file
-    local tmpf=$(mktemp) ; exec 5>$tmpf
-    {
-        # Initiate login process (session id and that shazba)
-        print "Initializing session.."
-        $CURL $CURL_OPTS -skLo /dev/null https://archive.org/account/login
-        # Send credentials
-        print "Sending credentials.."
-        $CURL $CURL_OPTS -skL -X POST \
-            --data-raw "username=$u&password=$p&remember=true" \
-            https://archive.org/account/login 2>&1 1>&5
-    } | $DIALOG --title $TITLE --progressbox "Logging in to archive.org" 8 78
-    # Cleanup and put login result to $res
-    exec 5>- ; local res=$(<$tmpf) ; rm $tmpf
-
-    # Check if login succeeded (this is a silly amount of trouble just to get 0/1 exit code.. sigh)
-    $JQ -er 'if .status == "ok" then . else null | halt_error(1) end' <<< $res >/dev/null 2>&1
-    [[ $? -eq 0 ]] && return
-
-    # It didn't
-    $DIALOG --title $TITLE \
-        --msgbox "Error logging in to archive.org. Please check IA_USER / IA_PASS variables." 5 78
-    cleanup
 }
 
 # Download XML files containing all ROM metadata
