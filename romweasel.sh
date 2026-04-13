@@ -512,8 +512,10 @@ queue_dispatcher_loop () {
                 if [[ -f ${item}/worker.pid ]] && kill -0 $(<${item}/worker.pid) 2>/dev/null; then
                     (( running++ ))
                 else
-                    # Worker died without updating status — mark failed
-                    print failed > ${item}/status
+                    # Worker died without updating status — re-queue so
+                    # wget -c can resume from download.part on the next
+                    # dispatcher tick.
+                    print queued > ${item}/status
                     rm -f ${item}/worker.pid ${item}/wget.pid
                 fi
             fi
@@ -585,17 +587,25 @@ queue_worker_run () {
     # Trap kills the actual wget child, not just this shell wrapper,
     # so cancel/exit actually stop the transfer instead of leaving an
     # orphan wget using bandwidth while the UI thinks it's paused.
-    trap '
+    # Note: 'local' is invalid outside a function in zsh and aborts
+    # the trap body, so we use globals here.
+    # zsh quirk: `exit` inside a function called from a trap returns
+    # from the function, NOT the shell — so we keep the helper for
+    # cleanup work and put the actual `exit` in the trap body string.
+    _queue_trap_handler () {
+        local _wp _st
         if [[ -f ${itemdir}/wget.pid ]]; then
-            local _wp=$(<${itemdir}/wget.pid)
+            _wp=$(<${itemdir}/wget.pid)
             kill -CONT $_wp 2>/dev/null
             kill -TERM $_wp 2>/dev/null
         fi
-        [[ -f ${itemdir}/status ]] && [[ $(<${itemdir}/status) == "running" ]] \
-            && print queued > ${itemdir}/status
-        rm -f ${itemdir}/worker.pid ${itemdir}/wget.pid
-        exit 130
-    ' TERM INT
+        if [[ -f ${itemdir}/status ]]; then
+            _st=$(<${itemdir}/status)
+            [[ $_st == "running" || $_st == "paused" ]] && print queued > ${itemdir}/status
+        fi
+        rm -f ${itemdir}/worker.pid ${itemdir}/wget.pid ${itemdir}/download.part.tmp
+    }
+    trap '_queue_trap_handler; exit 130' TERM INT
 
     # Launch wget, record its actual PID, poll progress in this shell.
     # queue_item_menu signals ${itemdir}/wget.pid directly for pause
@@ -613,9 +623,19 @@ queue_worker_run () {
     local rc=$?
     rm -f ${itemdir}/wget.pid
 
+    # If the trap already ran (e.g. TERM from the dispatcher / the
+    # outer TUI exit), status is already 'queued' and we must not
+    # overwrite it with 'failed'. 143 = 128+SIGTERM, 130 = 128+SIGINT.
     if [[ $rc -ne 0 ]]; then
-        print "ERROR: wget exited $rc" >> ${itemdir}/worker.log
-        print failed > ${itemdir}/status
+        local cur_status=""
+        [[ -f ${itemdir}/status ]] && cur_status=$(<${itemdir}/status)
+        if [[ $cur_status == "queued" ]] || (( rc == 143 )) || (( rc == 130 )); then
+            print "NOTE: wget exited $rc (interrupted) — item re-queued" >> ${itemdir}/worker.log
+            print queued > ${itemdir}/status
+        else
+            print "ERROR: wget exited $rc" >> ${itemdir}/worker.log
+            print failed > ${itemdir}/status
+        fi
         rm -f ${itemdir}/worker.pid
         exit $rc
     fi
