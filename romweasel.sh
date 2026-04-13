@@ -245,6 +245,10 @@ set_conf_opts () {
     typeset -gr C64_GAMEDIR=${C64_GAMEDIR:-/media/fat/games/C64}
     # Simplified mode for use without a keyboard (true/false toggle)
     typeset -g JOY_MODE=${JOY_MODE:-false}
+    # Max concurrent background downloads (1..5, default 3)
+    typeset -g MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-3}
+    (( MAX_CONCURRENT_DOWNLOADS < 1 )) && MAX_CONCURRENT_DOWNLOADS=1
+    (( MAX_CONCURRENT_DOWNLOADS > 5 )) && MAX_CONCURRENT_DOWNLOADS=5
 }
 
 # Dynamically set environment variables to point to currently selected repository
@@ -309,9 +313,472 @@ urlencode () {
 
 cleanup () {
     [[ -f $DIALOG_TEMPFILE ]] && rm $DIALOG_TEMPFILE
+    queue_kill_background
     [[ -f cookie.tmp ]] && rm cookie.tmp
     [[ $(ls -A $CACHE_DIR) ]] && print "Warning: cache dir $CACHE_DIR not empty"
     exit 0
+}
+
+#################################################################
+# Download queue — background workers, max N concurrent, user
+# can pause/resume/cancel/launch individual items from the queue
+# view. State files under $WRK_DIR/queue/ so the queue survives
+# script restart (interrupted downloads re-queue as 'queued' and
+# wget -c resumes from the partial file).
+#################################################################
+
+queue_dir () { print "${WRK_DIR}/queue" }
+
+queue_ensure_dir () {
+    local qd=$(queue_dir)
+    [[ -d $qd ]] || mkdir -p $qd
+    print $qd
+}
+
+# Set of status constants — stored as plain text in $itemdir/status
+# queued:    waiting for a worker slot
+# running:   wget in flight
+# paused:    SIGSTOP'd worker (partial file preserved)
+# done:      transferred and installed into game dir
+# failed:    download or checksum failed
+# cancelled: user aborted, partial file removed
+
+# Enqueue an array of ROM tags for the currently selected core.
+# Creates one item dir per tag under $WRK_DIR/queue/<ts>_<slug>/
+# and spawns the dispatcher if not already running.
+queue_enqueue () {
+    local -a tags=($@)
+    local qd=$(queue_ensure_dir)
+    local tag size sha1 filename slug ts itemdir i=0
+    for tag in $tags; do
+        (( i++ ))
+        size=$(get_tag_filesize "$tag")
+        sha1=$(get_tag_sha1sum "$tag")
+        filename=$(get_tag_filename "$tag")
+        # Unique ordered id: epoch seconds + counter + sanitized name
+        ts=$(date +%s)
+        slug=${${tag##*/}%.(7z|zip|chd)}
+        slug=${slug//[^A-Za-z0-9._-]/_}
+        slug=${slug:0:48}
+        itemdir="${qd}/${ts}_${i}_${slug}"
+        mkdir -p $itemdir
+        # Shell-sourceable meta, avoids embedded newlines in tag
+        {
+            print "TAG=\"${tag}\""
+            print "FILENAME=\"${filename}\""
+            print "CORE=\"${CORE}\""
+            print "CORE_URL=\"${CORE_URL}\""
+            print "CORE_FILES_XML=\"${CORE_FILES_XML}\""
+            print "DEST_DIR=\"${CORE_GAMEDIR}\""
+            print "SIZE=\"${size}\""
+            print "SHA1=\"${sha1}\""
+            print "ADDED_AT=\"${ts}\""
+        } > $itemdir/meta
+        print queued > $itemdir/status
+        print 0 > $itemdir/progress
+    done
+    queue_spawn_dispatcher
+}
+
+# Spawn the dispatcher as a detached background process if not
+# already running. Dispatcher uses flock to guarantee singleton.
+queue_spawn_dispatcher () {
+    local qd=$(queue_ensure_dir)
+    print ${MAX_CONCURRENT_DOWNLOADS} > ${qd}/.max_concurrent
+    if [[ -f ${qd}/.dispatcher.pid ]]; then
+        local pid=$(<${qd}/.dispatcher.pid)
+        if kill -0 $pid 2>/dev/null; then
+            return 0
+        fi
+    fi
+    setsid zsh $ROMWEASEL_SELF --dispatcher </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+# Count queue items by status
+queue_counts () {
+    local qd=$(queue_dir)
+    [[ -d $qd ]] || { print "0 0 0 0 0 0" ; return }
+    local q r p d f c
+    q=0 r=0 p=0 d=0 f=0 c=0
+    local item st
+    for item in ${qd}/*(N/); do
+        [[ -f ${item}/status ]] || continue
+        st=$(<${item}/status)
+        case $st in
+            queued)    (( q++ )) ;;
+            running)   (( r++ )) ;;
+            paused)    (( p++ )) ;;
+            done)      (( d++ )) ;;
+            failed)    (( f++ )) ;;
+            cancelled) (( c++ )) ;;
+        esac
+    done
+    print "$q $r $p $d $f $c"
+}
+
+queue_total () {
+    local counts=($(queue_counts))
+    print $(( counts[1] + counts[2] + counts[3] + counts[4] + counts[5] + counts[6] ))
+}
+
+# Kill dispatcher + all workers, mark in-progress items as queued
+# so they resume on next launch. Called from cleanup().
+queue_kill_background () {
+    local qd=$(queue_dir)
+    [[ -d $qd ]] || return 0
+    # Kill dispatcher
+    if [[ -f ${qd}/.dispatcher.pid ]]; then
+        local dpid=$(<${qd}/.dispatcher.pid)
+        kill -TERM $dpid 2>/dev/null
+    fi
+    # Kill workers and re-queue
+    local item wpid st
+    for item in ${qd}/*(N/); do
+        [[ -f ${item}/worker.pid ]] || continue
+        wpid=$(<${item}/worker.pid)
+        kill -TERM $wpid 2>/dev/null
+        rm -f ${item}/worker.pid
+        [[ -f ${item}/status ]] || continue
+        st=$(<${item}/status)
+        if [[ $st == "running" || $st == "paused" ]]; then
+            print queued > ${item}/status
+        fi
+    done
+    # Small grace period then SIGKILL any stragglers
+    sleep 0.3
+    if [[ -f ${qd}/.dispatcher.pid ]]; then
+        kill -KILL $(<${qd}/.dispatcher.pid) 2>/dev/null
+        rm -f ${qd}/.dispatcher.pid
+    fi
+}
+
+# Dispatcher loop — invoked via `romweasel.sh --dispatcher`.
+# Drains queued items, respecting MAX_CONCURRENT_DOWNLOADS, by
+# spawning per-item worker subprocesses. Exits when nothing left
+# to do. Singleton-enforced via flock.
+queue_dispatcher_loop () {
+    local qd=$(queue_dir)
+    [[ -d $qd ]] || exit 0
+    exec 9>${qd}/.dispatcher.lock
+    flock -n 9 || exit 0
+    print $$ > ${qd}/.dispatcher.pid
+    trap 'rm -f ${qd}/.dispatcher.pid; exit 0' EXIT TERM INT
+
+    local max running next_dir item st any_work
+    while true; do
+        # Refresh max from file (allows live updates)
+        if [[ -f ${qd}/.max_concurrent ]]; then
+            max=$(<${qd}/.max_concurrent)
+        else
+            max=3
+        fi
+        (( max < 1 )) && max=1
+        (( max > 5 )) && max=5
+
+        # Count running workers; reconcile dead workers
+        running=0
+        for item in ${qd}/*(N/); do
+            [[ -f ${item}/status ]] || continue
+            st=$(<${item}/status)
+            if [[ $st == "running" ]]; then
+                if [[ -f ${item}/worker.pid ]] && kill -0 $(<${item}/worker.pid) 2>/dev/null; then
+                    (( running++ ))
+                else
+                    # Worker died without updating status — mark failed
+                    print failed > ${item}/status
+                    rm -f ${item}/worker.pid
+                fi
+            fi
+        done
+
+        # Fill empty slots
+        while (( running < max )); do
+            next_dir=""
+            for item in ${qd}/*(N/); do
+                [[ -f ${item}/status ]] || continue
+                if [[ $(<${item}/status) == "queued" ]]; then
+                    next_dir=$item
+                    break
+                fi
+            done
+            [[ -z $next_dir ]] && break
+            print running > ${next_dir}/status
+            setsid zsh $ROMWEASEL_SELF --worker "$next_dir" </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
+            (( running++ ))
+            sleep 0.2
+        done
+
+        # Exit if nothing active and nothing queued
+        any_work=false
+        for item in ${qd}/*(N/); do
+            [[ -f ${item}/status ]] || continue
+            st=$(<${item}/status)
+            if [[ $st == "queued" || $st == "running" ]]; then
+                any_work=true
+                break
+            fi
+        done
+        $any_work || break
+
+        sleep 2
+    done
+    rm -f ${qd}/.dispatcher.pid
+}
+
+# Worker body — invoked via `romweasel.sh --worker <itemdir>`.
+# Downloads meta.URL to meta.DEST_DIR, verifies SHA1, extracts if
+# compressed, and updates status. Partial file at $itemdir/download.part
+# allows SIGTERM recovery via wget -c on next run.
+queue_worker_run () {
+    local itemdir=$1
+    [[ -d $itemdir ]] || exit 1
+    [[ -f ${itemdir}/meta ]] || exit 1
+
+    source ${itemdir}/meta
+    print $$ > ${itemdir}/worker.pid
+
+    local tmpfile="${itemdir}/download.part"
+    local url="${CORE_URL}/$(urlencode "${FILENAME}")"
+    local cookiejar="${WRK_DIR}/cookie.tmp"
+    local wget_args=(-c --read-timeout=60 --tries=20 --waitretry=5
+                     --connect-timeout=15 -O "$tmpfile" "$url")
+    [[ -f $cookiejar ]] && wget_args=(--load-cookies "$cookiejar" $wget_args)
+
+    trap '
+        [[ -f ${itemdir}/status ]] && [[ $(<${itemdir}/status) == "running" ]] \
+            && print queued > ${itemdir}/status
+        rm -f ${itemdir}/worker.pid
+        exit 130
+    ' TERM INT
+
+    # Launch wget, poll progress in this shell
+    wget $wget_args 2>>${itemdir}/worker.log &
+    local wget_pid=$!
+    while kill -0 $wget_pid 2>/dev/null; do
+        if [[ -f $tmpfile ]]; then
+            stat -c %s "$tmpfile" > ${itemdir}/progress 2>/dev/null
+        fi
+        sleep 1
+    done
+    wait $wget_pid
+    local rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        print failed > ${itemdir}/status
+        rm -f ${itemdir}/worker.pid
+        exit $rc
+    fi
+
+    # Verify checksum
+    local filesum=${${(z):-$($SHA1SUM "$tmpfile")}[1]}
+    if [[ -n $SHA1 && "$filesum" != "$SHA1" ]]; then
+        print "ERROR: checksum mismatch got=$filesum want=$SHA1" >> ${itemdir}/worker.log
+        print failed > ${itemdir}/status
+        rm -f ${itemdir}/worker.pid
+        exit 1
+    fi
+
+    # Install to dest dir
+    [[ -d "$DEST_DIR" ]] || mkdir -p "$DEST_DIR"
+    local basefile=${FILENAME##*/}
+    if [[ -z ${basefile##*.7z} ]]; then
+        $SZR e "$tmpfile" -o"$DEST_DIR" -y >>${itemdir}/worker.log 2>&1
+        rm -f "$tmpfile"
+    elif [[ -z ${basefile##*.zip} ]]; then
+        $UNZIP -o -qq -d "$DEST_DIR" "$tmpfile" >>${itemdir}/worker.log 2>&1
+        rm -f "$tmpfile"
+    else
+        mv "$tmpfile" "${DEST_DIR}/${basefile}"
+    fi
+
+    print done > ${itemdir}/status
+    rm -f ${itemdir}/worker.pid
+}
+
+# Dialog-based queue browser. Select an item to act on it.
+queue_view () {
+    local qd=$(queue_dir)
+    while true; do
+        local -a menu_args items
+        menu_args=()
+        items=()
+        local item st prog pct name core_name size_mb label icon
+
+        for item in ${qd}/*(N/); do
+            [[ -f ${item}/meta ]] || continue
+            [[ -f ${item}/status ]] || continue
+            st=$(<${item}/status)
+            prog=0
+            [[ -f ${item}/progress ]] && prog=$(<${item}/progress)
+            source ${item}/meta
+            pct=0
+            (( SIZE > 0 )) && pct=$(( prog * 100 / SIZE ))
+            (( pct > 100 )) && pct=100
+            size_mb=$(( SIZE / 1048576 ))
+            name=${FILENAME##*/}
+            name=${name%.(7z|zip|chd)}
+            case $st in
+                queued)    icon="WAIT " ;;
+                running)   icon="DL ${pct}%" ;;
+                paused)    icon="PAUSE" ;;
+                done)      icon="DONE " ;;
+                failed)    icon="FAIL " ;;
+                cancelled) icon="CANCL" ;;
+                *)         icon="?????" ;;
+            esac
+            label="[${icon}] ${CORE} ${name} (${size_mb}M)"
+            items+=("${item}")
+            menu_args+=("${item}" "${label:0:$(( MAXWIDTH - 10 ))}")
+        done
+
+        if (( ${#items} == 0 )); then
+            $DIALOG --title "Download Queue" --msgbox \
+                "Queue is empty.\n\nStart a download to populate it." 8 50
+            return
+        fi
+
+        $DIALOG --clear --title "Download Queue (max ${MAX_CONCURRENT_DOWNLOADS} concurrent)" \
+            --extra-button --extra-label "Refresh" \
+            --help-button --help-label "Settings" \
+            --cancel-label "Back" --ok-label "Manage" \
+            --menu "Select item to manage:" \
+            $MAXHEIGHT $MAXWIDTH $#items \
+            $menu_args 2>$DIALOG_TEMPFILE
+        local rc=$?
+        case $rc in
+            $DIALOG_OK)
+                queue_item_menu "$(<$DIALOG_TEMPFILE)"
+                ;;
+            $DIALOG_EXTRA)
+                continue
+                ;;
+            $DIALOG_HELP)
+                queue_settings_menu
+                ;;
+            *)
+                return
+                ;;
+        esac
+    done
+}
+
+# Actions for a single queue item
+queue_item_menu () {
+    local itemdir=$1
+    [[ -d $itemdir && -f ${itemdir}/meta ]] || return
+    source ${itemdir}/meta
+    local st=$(<${itemdir}/status)
+    local name=${FILENAME##*/}
+
+    local -a actions=()
+    case $st in
+        queued)
+            actions+=(cancel "Remove from queue")
+            ;;
+        running)
+            actions+=(pause "Pause")
+            actions+=(cancel "Cancel and discard partial")
+            ;;
+        paused)
+            actions+=(resume "Resume")
+            actions+=(cancel "Cancel and discard partial")
+            ;;
+        done)
+            actions+=(launch "Launch game now")
+            actions+=(remove "Remove from queue list")
+            ;;
+        failed|cancelled)
+            actions+=(retry "Retry download")
+            actions+=(remove "Remove from queue list")
+            ;;
+    esac
+    actions+=(log "View worker log")
+    actions+=(back "Back")
+
+    $DIALOG --clear --title "${name}" \
+        --menu "Status: ${st}\nCore: ${CORE}\nSize: $(( SIZE / 1048576 )) MB" \
+        16 72 8 $actions 2>$DIALOG_TEMPFILE
+    [[ $? -ne $DIALOG_OK ]] && return
+    local action=$(<$DIALOG_TEMPFILE)
+
+    case $action in
+        pause)
+            [[ -f ${itemdir}/worker.pid ]] && kill -STOP $(<${itemdir}/worker.pid) 2>/dev/null
+            print paused > ${itemdir}/status
+            ;;
+        resume)
+            [[ -f ${itemdir}/worker.pid ]] && kill -CONT $(<${itemdir}/worker.pid) 2>/dev/null
+            print running > ${itemdir}/status
+            ;;
+        cancel)
+            if [[ -f ${itemdir}/worker.pid ]]; then
+                kill -CONT $(<${itemdir}/worker.pid) 2>/dev/null
+                kill -TERM $(<${itemdir}/worker.pid) 2>/dev/null
+            fi
+            print cancelled > ${itemdir}/status
+            rm -f ${itemdir}/download.part ${itemdir}/worker.pid
+            queue_spawn_dispatcher
+            ;;
+        retry)
+            print queued > ${itemdir}/status
+            print 0 > ${itemdir}/progress
+            rm -f ${itemdir}/worker.log
+            queue_spawn_dispatcher
+            ;;
+        remove)
+            if [[ -f ${itemdir}/worker.pid ]]; then
+                kill -CONT $(<${itemdir}/worker.pid) 2>/dev/null
+                kill -TERM $(<${itemdir}/worker.pid) 2>/dev/null
+            fi
+            rm -rf $itemdir
+            ;;
+        launch)
+            local target="${DEST_DIR}/${FILENAME##*/}"
+            # For compressed files the base name differs — do a best-effort glob
+            if [[ ! -f $target ]]; then
+                local hits=(${DEST_DIR}/${${FILENAME##*/}%.(7z|zip|chd)}*(N))
+                [[ -n $hits ]] && target=$hits[1]
+            fi
+            if [[ -f $target ]]; then
+                if [[ -x /media/fat/Scripts/zaparoo.sh ]]; then
+                    /media/fat/Scripts/zaparoo.sh -run "$target" >/dev/null 2>&1 &
+                else
+                    print "load_core $target" > /dev/MiSTer_cmd 2>/dev/null
+                fi
+                sleep 1
+                exit 0
+            else
+                $DIALOG --msgbox "File not found on disk:\n$target" 7 70
+            fi
+            ;;
+        log)
+            if [[ -f ${itemdir}/worker.log ]]; then
+                $DIALOG --title "Worker log" --textbox ${itemdir}/worker.log \
+                    $MAXHEIGHT $MAXWIDTH
+            else
+                $DIALOG --msgbox "No log available." 5 40
+            fi
+            ;;
+    esac
+}
+
+queue_settings_menu () {
+    local choice
+    $DIALOG --title "Queue settings" \
+        --menu "Max concurrent downloads (1..5):" 12 50 5 \
+        1 "1 download at a time" \
+        2 "2 concurrent" \
+        3 "3 concurrent (default)" \
+        4 "4 concurrent" \
+        5 "5 concurrent (max)" \
+        2>$DIALOG_TEMPFILE
+    [[ $? -ne $DIALOG_OK ]] && return
+    choice=$(<$DIALOG_TEMPFILE)
+    MAX_CONCURRENT_DOWNLOADS=$choice
+    print $choice > $(queue_dir)/.max_concurrent
+    queue_spawn_dispatcher
 }
 
 # Login to archive.org and setup a cookie for all downloads, if IA_USER/IA_PASS
@@ -496,21 +963,22 @@ ao486_setnames_all () {
     print "Done!"
 }
 
-# Download selected ROMs
+# Download selected ROMs — enqueues into the background download
+# queue (max ${MAX_CONCURRENT_DOWNLOADS} concurrent, default 3) and
+# returns to the menu immediately. Progress, pause/resume, cancel,
+# and launch-after-download are available from the [Queue] entry on
+# the main menu.
 download_roms () {
     local -a tags=(${*})
-    local tag url ofile
     local rominfo="$(get_rom_info $tags)"
-    rominfo+="\nDownload selected game(s)?\n"
+    rominfo+="\nEnqueue ${#tags} item(s) for background download?\n"
+    rominfo+="Progress and controls: main menu -> [Queue]\n"
 
-    $DIALOG --title "Information for selected ROM(s)" --clear --cr-wrap --colors \
+    $DIALOG --title "Confirm enqueue" --clear --cr-wrap --colors \
         --yesno "$rominfo" $(( $MAXHEIGHT / 2 )) $MAXWIDTH 2>$DIALOG_TEMPFILE
     local retval=$?
     [[ $retval -eq $DIALOG_CANCEL ]] && return
     [[ $retval -ne $DIALOG_OK ]] && cleanup
-
-    # In case the file exists already, cURL will attempt to continue the download
-    local cl=(-C - -kL)
 
     # Make sure target directory exists or if user wants it to be created
     if [[ ! -d $CORE_GAMEDIR ]]; then
@@ -522,6 +990,22 @@ download_roms () {
         [[ $retval -ne $DIALOG_OK ]] && cleanup
         mkdir -p $CORE_GAMEDIR
     fi
+
+    # Enqueue all selected tags and return to menu
+    queue_enqueue $tags
+    $DIALOG --title "Queued" --msgbox \
+        "${#tags} item(s) added to the download queue.\n\nReturn to the main menu and open [Queue] to monitor." \
+        9 60 2>$DIALOG_TEMPFILE
+    return
+}
+
+# Legacy synchronous download path — no longer invoked by the TUI
+# but retained in case a future feature wants inline behaviour.
+download_roms_inline () {
+    local -a tags=(${*})
+    local tag url ofile
+    # In case the file exists already, cURL will attempt to continue the download
+    local cl=(-C - -kL)
 
     for tag in $tags; do
         # Confirm final destination directory
@@ -831,22 +1315,42 @@ main () {
         $JOY_MODE && jm=" (Simple Mode)" || unset jm
         typeset -g TITLE="${ROMWEASEL_VERSION}${jm}"
 
-        # Show main ROM repository menu
+        # Show main ROM repository menu.
+        # A dynamic "QUEUE" pseudo-entry is prepended so the user can
+        # reach queue_view without sacrificing a dialog button slot.
         $JOY_MODE && jm="Normal Mode" || jm="Simple Mode"
+        local -a menu_entries=()
+        local qcounts=($(queue_counts))
+        local qtotal=$(( qcounts[1] + qcounts[2] + qcounts[3] + qcounts[4] + qcounts[5] + qcounts[6] ))
+        local qlabel
+        if (( qtotal > 0 )); then
+            qlabel="[Queue]  ${qcounts[1]} waiting, ${qcounts[2]} running, ${qcounts[4]} done"
+        else
+            qlabel="[Queue]  (empty)"
+        fi
+        menu_entries+=("QUEUE" "$qlabel")
+        menu_entries+=($SUPPORTED_CORES)
         $DIALOG --title $TITLE --cancel-label "Quit" --help-button --help-tags --help-status \
             --default-item "$default_item" --extra-button --extra-label "Info" --help-label $jm \
-            --menu "Choose target system/repository:" 0 80 0 $SUPPORTED_CORES 2>$DIALOG_TEMPFILE
+            --menu "Choose target system/repository:" 0 80 0 $menu_entries 2>$DIALOG_TEMPFILE
         retval=$?
 
         case $retval in
-            # Open game list for selected ROM repository
+            # Open game list for selected ROM repository (or queue view)
             $DIALOG_OK)
-                select_core $(<$DIALOG_TEMPFILE)
-                game_menu ;;
+                local picked=$(<$DIALOG_TEMPFILE)
+                if [[ $picked == "QUEUE" ]]; then
+                    queue_view
+                else
+                    select_core $picked
+                    game_menu
+                fi ;;
 
             # Repurposed for toggling simplified joystick mode on and off
             $DIALOG_HELP)
-                select_core ${(@f)$(<$DIALOG_TEMPFILE)[2]}
+                local helpsel=${(@f)$(<$DIALOG_TEMPFILE)[2]}
+                [[ $helpsel == "QUEUE" ]] && continue
+                select_core $helpsel
                 $JOY_MODE && { JOY_MODE=false ; jm='\Z6Disabled!\Zn' } || { JOY_MODE=true ; jm='\Z5Enabled!\Zn' }
                 $DIALOG --title $TITLE --cr-wrap --colors --msgbox "Simplified joystick mode:\n\n$jm" \
                     8 0 2>$DIALOG_TEMPFILE
@@ -855,7 +1359,12 @@ main () {
 
             # Show information for currently selected ROM repository
             $DIALOG_EXTRA)
-                select_core $(<$DIALOG_TEMPFILE)
+                local extrasel=$(<$DIALOG_TEMPFILE)
+                if [[ $extrasel == "QUEUE" ]]; then
+                    queue_view
+                    continue
+                fi
+                select_core $extrasel
                 t=$($XMLLINT $CORE_META_XML --xpath "string(metadata/title)")
                 d=$($XMLLINT $CORE_META_XML --xpath "string(metadata/addeddate)")
                 $DIALOG --title "ROM repository info" --msgbox "\
@@ -875,5 +1384,28 @@ Added: $d" 10 $MAXWIDTH
     cleanup
 }
 
-## For easy debug/test entry point
-main $*
+## Entry point.
+## Special subcommands --dispatcher and --worker are used by the queue
+## feature to re-execute the script in background-process roles. They
+## set up only the minimum state needed and bypass the TUI.
+typeset -gr ROMWEASEL_SELF="${0:A}"
+case ${1:-} in
+    --dispatcher)
+        init_static_globals
+        # get_config also calls set_conf_opts internally
+        pushd $WRK_DIR >/dev/null 2>&1 || mkdir -p $WRK_DIR && pushd $WRK_DIR >/dev/null
+        get_config
+        queue_dispatcher_loop
+        exit 0
+        ;;
+    --worker)
+        init_static_globals
+        pushd $WRK_DIR >/dev/null 2>&1 || mkdir -p $WRK_DIR && pushd $WRK_DIR >/dev/null
+        get_config
+        queue_worker_run "$2"
+        exit 0
+        ;;
+    *)
+        main $*
+        ;;
+esac
