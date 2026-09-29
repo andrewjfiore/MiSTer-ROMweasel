@@ -1,5 +1,7 @@
 # MiSTer-ROMweasel
 
+> **LLM coding experiment.** This project was built mostly by AI coding agents as an experiment. It is not maintained, reviewed, or tested for real use. Do not rely on it for anything that matters.
+
 ROM downloader tool for MiSTer FPGA (release version 0.9.15)
 
 ## Usage
